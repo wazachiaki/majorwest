@@ -890,16 +890,68 @@ button{touch-action:manipulation}textarea{line-height:1.6}
    ============================================================ */
 const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbz_hMXe9C1UjmPRW8C668yVx80S45KLd_YRZDTwSGKIhs7Igbcrord6j67t_BlrozdP5w/exec';
 
+/* ---- ローカルキャッシュ（stale-while-revalidate）------------
+   前回取得した共有データを即座に返して画面を描画し、
+   裏で最新をGASに取りに行く。差分があれば onFresh で通知して再描画。
+   → 2回目以降の起動が体感ゼロ秒になる。 ---------------------- */
+const SWR_PREFIX = 'swr:';
+const _freshListeners = {};
+const _inflight = {};
+
+function cacheRead(key){
+  try{ const v = localStorage.getItem(SWR_PREFIX+key); return v===null ? undefined : v; }
+  catch(e){ return undefined; }
+}
+function cacheWrite(key, value){
+  try{ localStorage.setItem(SWR_PREFIX+key, value==null ? '' : value); }catch(e){}
+}
+function cacheDrop(key){
+  try{ localStorage.removeItem(SWR_PREFIX+key); }catch(e){}
+}
+function emitFresh(key, value){
+  (_freshListeners[key]||[]).forEach(fn=>{ try{ fn(value); }catch(e){} });
+}
+/* 入力中なら再描画を見送る（打ちかけの内容を消さないため） */
+function isTyping(){
+  const el = document.activeElement;
+  if(!el) return false;
+  return el.tagName==='INPUT' || el.tagName==='TEXTAREA' || el.isContentEditable === true;
+}
+async function fetchShared(key){
+  if(_inflight[key]) return _inflight[key];
+  const pr = (async()=>{
+    try{
+      const res = await fetch(`${BACKEND_URL}?action=get&key=${encodeURIComponent(key)}`);
+      if(!res.ok) throw new Error('backend get failed: ' + res.status);
+      const data = await res.json();
+      return data.value;
+    } finally { delete _inflight[key]; }
+  })();
+  _inflight[key] = pr;
+  return pr;
+}
+
 const storage = {
-  async get(key, shared){
+  onFresh(key, fn){ (_freshListeners[key] = _freshListeners[key] || []).push(fn); },
+  async get(key, shared, opts){
     if(!shared){
       const v = localStorage.getItem('local:'+key);
       return { key, value: v, shared:false };
     }
-    const res = await fetch(`${BACKEND_URL}?action=get&key=${encodeURIComponent(key)}`);
-    if(!res.ok) throw new Error('backend get failed: ' + res.status);
-    const data = await res.json();
-    return { key, value: data.value, shared:true };
+    const cached = (opts && opts.fresh) ? undefined : cacheRead(key);
+    if(cached !== undefined){
+      // 先にキャッシュを返し、裏で最新を取得
+      fetchShared(key).then(value=>{
+        const norm = value==null ? '' : value;
+        if(norm !== cached){ cacheWrite(key, value); emitFresh(key, value); }
+      }).catch(()=>{});
+      return { key, value: cached==='' ? null : cached, shared:true, fromCache:true };
+    }
+    const value = await fetchShared(key);
+    const prev = cacheRead(key);
+    cacheWrite(key, value);
+    if(opts && opts.fresh && prev !== undefined && (value==null?'':value) !== prev) emitFresh(key, value);
+    return { key, value, shared:true };
   },
   async set(key, value, shared){
     if(!shared){
@@ -912,6 +964,7 @@ const storage = {
       body: JSON.stringify({ action:'set', key, value })
     });
     if(!res.ok) throw new Error('backend set failed: ' + res.status);
+    cacheWrite(key, value);
     return { key, value, shared:true };
   },
   async delete(key, shared){
@@ -925,6 +978,7 @@ const storage = {
       body: JSON.stringify({ action:'delete', key })
     });
     if(!res.ok) throw new Error('backend delete failed: ' + res.status);
+    cacheDrop(key);
     return { key, deleted:true, shared:true };
   },
   async list(prefix, shared){
@@ -1148,6 +1202,10 @@ async function loadProfiles(){
     staffProfiles = res && res.value ? JSON.parse(res.value) : {};
   }catch(e){ staffProfiles = {}; }
 }
+storage.onFresh(PROFILES_KEY, v=>{
+  try{ staffProfiles = v ? JSON.parse(v) : {}; }catch(e){ staffProfiles = {}; }
+  try{ renderWhoAmI(); }catch(e){}
+});
 async function saveMyProfile(avatar){
   staffProfiles[myName] = avatar;
   try{ await storage.set(PROFILES_KEY, JSON.stringify(staffProfiles), true); }
@@ -1483,7 +1541,9 @@ const CrmMod = (function(){
   }
 
   return {
-    async init(){ await load(); bind(); renderList(); renderMain(); },
+    async init(){ await load(); bind(); renderList(); renderMain();
+      storage.onFresh(KEY, v=>{ try{ db = v ? JSON.parse(v) : []; }catch(e){ db = []; } if(!isTyping()){ renderList(); renderMain(); } });
+    },
     render(){ renderList(); renderMain(); },
     stats(){ return { total: db.length, followup: db.filter(c=>c.logs.some(l=>l.needsFollowup)).length }; },
     getAll(){ return db; }
@@ -1731,7 +1791,9 @@ const BoardMod = (function(){
   }
 
   return {
-    async init(){ await load(); bind(); render(); },
+    async init(){ await load(); bind(); render();
+      storage.onFresh(KEY, v=>{ try{ posts = v ? JSON.parse(v) : []; }catch(e){ posts = []; } if(!isTyping()) render(); });
+    },
     render(){ render(); },
     stats(){ return { total: posts.length, unread: posts.filter(p=>!(p.readBy||[]).includes(myName)).length }; },
     getAll(){ return posts; }
@@ -1905,7 +1967,11 @@ const AttMod = (function(){
   }
 
   return {
-    async init(){ await load(); bind(); renderAll(); },
+    async init(){ await load(); bind(); renderAll();
+      storage.onFresh(KEY, v=>{ try{ db = v ? JSON.parse(v) : { records:[], requests:[], confirmed:[] }; }catch(e){ db = { records:[], requests:[], confirmed:[] }; }
+        db.records = db.records||[]; db.requests = db.requests||[]; db.confirmed = db.confirmed||[];
+        if(!isTyping()) renderAll(); });
+    },
     renderAll(){ renderAll(); },
     stats(){
       const t = todayStr();
@@ -2404,7 +2470,9 @@ const ProjMod = (function(){
   }
 
   return {
-    async init(){ await load(); bind(); renderList(); renderMainPane(); },
+    async init(){ await load(); bind(); renderList(); renderMainPane();
+      storage.onFresh(KEY, v=>{ try{ db = v ? JSON.parse(v) : []; }catch(e){ db = []; } if(!isTyping()){ renderList(); renderMainPane(); } });
+    },
     render(){ renderList(); renderMainPane(); },
     stats(){
       const t = todayStr();
@@ -2435,9 +2503,9 @@ const ChatMod = (function(){
 
   function dmKey(a, b){ return 'dm:' + [a,b].sort().join('|'); }
 
-  async function load(){
+  async function load(opts){
     try{
-      const res = await storage.get(KEY, true);
+      const res = await storage.get(KEY, true, opts);
       messages = res && res.value ? JSON.parse(res.value) : [];
     }catch(e){ messages = []; }
   }
@@ -2504,7 +2572,7 @@ const ChatMod = (function(){
 
   async function refresh(){
     const before = messages.length;
-    await load();
+    await load({ fresh:true });
     if(messages.length !== before){
       if(mode==='dm') populateDmSelect();
       render(true);
@@ -2589,7 +2657,7 @@ const NotifMod = (function(){
 
   async function fetchRaw(key){
     try{
-      const res = await storage.get(key, true);
+      const res = await storage.get(key, true, { fresh:true });
       return res && res.value ? JSON.parse(res.value) : null;
     }catch(e){ return null; }
   }
@@ -3305,21 +3373,48 @@ function bindMobileNav(){
 
 let chatInited = false, notifInited = false, assetInited = false;
 
+function setSyncing(on){
+  let el = document.getElementById('syncPill');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'syncPill';
+    el.setAttribute('aria-live', 'polite');
+    el.innerHTML = '<span class="sync-dot"></span>データ同期中…';
+    el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:9999;display:flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;font-size:12px;letter-spacing:.02em;background:rgba(10,24,46,.94);color:#bcd9ff;border:1px solid rgba(120,180,255,.35);box-shadow:0 6px 20px rgba(0,0,0,.45);pointer-events:none;opacity:0;transition:opacity .25s ease';
+    const dot = el.querySelector('.sync-dot');
+    dot.style.cssText = 'width:7px;height:7px;border-radius:50%;background:#5aa9ff;animation:syncPulse 1s ease-in-out infinite';
+    if(!document.getElementById('syncPillKeyframes')){
+      const st = document.createElement('style');
+      st.id = 'syncPillKeyframes';
+      st.textContent = '@keyframes syncPulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1.15)}}';
+      document.head.appendChild(st);
+    }
+    document.body.appendChild(el);
+  }
+  el.style.opacity = on ? '1' : '0';
+}
+
 async function startApp(){
   $('#loginScreen').style.display = 'none';
   $('#appShell').style.display = 'flex';
 
-  await loadProfiles();
-  renderWhoAmI();
-
-  await Promise.all([ CrmMod.init(), BoardMod.init(), AttMod.init(), ProjMod.init() ]);
-  Home.render();
-
+  // ① まず操作できる状態にする（データ待ちで画面が固まらないように）
   $$('.nav-item').forEach(btn=>{
     btn.addEventListener('click', ()=> switchView(btn.dataset.view));
   });
   $('#export-all-btn').addEventListener('click', exportAllData);
   bindMobileNav();
+  renderWhoAmI();
+  Home.render();
+  setSyncing(true);
+
+  // ② プロフィールと各モジュールを並列で取得（直列待ちをやめる）
+  await Promise.all([
+    loadProfiles().then(()=> renderWhoAmI()),
+    CrmMod.init(), BoardMod.init(), AttMod.init(), ProjMod.init()
+  ]);
+  Home.render();
+  setSyncing(false);
 
   // 通知は少し遅らせてバックグラウンドで初期化（初期表示をブロックしない）
   setTimeout(async ()=>{
