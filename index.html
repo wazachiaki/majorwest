@@ -903,7 +903,16 @@ function cacheRead(key){
   catch(e){ return undefined; }
 }
 function cacheWrite(key, value){
-  try{ localStorage.setItem(SWR_PREFIX+key, value==null ? '' : value); }catch(e){}
+  try{
+    localStorage.setItem(SWR_PREFIX+key, value==null ? '' : value);
+    localStorage.setItem(SWR_PREFIX+'ts:'+key, String(Date.now()));
+  }catch(e){}
+}
+/* 直前に取得したばかりのキーは裏の再取得をスキップする（無駄な往復を防ぐ） */
+const FRESH_WINDOW_MS = 15000;
+function cacheAge(key){
+  try{ const t = +localStorage.getItem(SWR_PREFIX+'ts:'+key); return t ? Date.now()-t : Infinity; }
+  catch(e){ return Infinity; }
 }
 function cacheDrop(key){
   try{ localStorage.removeItem(SWR_PREFIX+key); }catch(e){}
@@ -931,6 +940,84 @@ async function fetchShared(key){
   return pr;
 }
 
+/* ---- GAS 一括取得API（getMulti）対応 ------------------------
+   バックエンドが getMulti に対応していれば起動時の往復が5回→1回になる。
+   未対応のうちは従来どおり個別取得のまま動き、対応を検知した次回起動から
+   自動で速い経路に切り替わる。サイト側の再デプロイは不要。 ------- */
+const MULTI_FLAG  = SWR_PREFIX + 'multi-ok';
+const MULTI_PROBE = SWR_PREFIX + 'multi-probe-at';
+const PROBE_INTERVAL_MS = 60 * 60 * 1000;   // 未対応なら1時間に1回だけ様子を見る
+const BOOT_KEYS = ['staff-profiles','customers-db','bulletin-board','attendance-db','projects-db'];
+
+async function fetchMulti(keys){
+  const res = await fetch(`${BACKEND_URL}?action=getMulti&keys=${encodeURIComponent(keys.join(','))}`);
+  if(!res.ok) throw new Error('getMulti failed: ' + res.status);
+  const data = await res.json();
+  if(!data || !data.values){
+    // バックエンドが getMulti を知らない場合だけ「未対応」と判定する。
+    // 通信断やタブ離脱による失敗で対応フラグを消さないための区別。
+    const err = new Error('getMulti unsupported'); err.unsupported = true; throw err;
+  }
+  return data.values;
+}
+function storeMulti(values){
+  BOOT_KEYS.forEach(k=>{
+    const v = values[k];
+    const prev = cacheRead(k);
+    const norm = v==null ? '' : v;
+    cacheWrite(k, v);
+    if(prev !== undefined && norm !== prev) emitFresh(k, v);
+  });
+}
+/* 起動時に一括取得を試みる。
+   キャッシュが揃っているときは待たずに裏で更新（起動を止めない）。
+   キャッシュが無い初回だけ、一括取得の完了を待つ（1往復で全部揃うため）。 */
+async function primeFromMulti(){
+  let supported = false;
+  try{ supported = localStorage.getItem(MULTI_FLAG) === 'yes'; }catch(e){}
+  if(supported){
+    const hasCache = BOOT_KEYS.every(k=> cacheRead(k) !== undefined);
+    const job = fetchMulti(BOOT_KEYS).then(storeMulti).catch(e=>{
+      if(e && e.unsupported){ try{ localStorage.removeItem(MULTI_FLAG); }catch(_){} }
+    });
+    if(!hasCache) await job;      // 初回だけ待つ
+    return true;
+  }
+  // 未対応：起動はブロックせず、1時間に1回だけ裏で対応可否を確かめる
+  let last = 0;
+  try{ last = +localStorage.getItem(MULTI_PROBE) || 0; }catch(e){}
+  if(Date.now() - last > PROBE_INTERVAL_MS){
+    try{ localStorage.setItem(MULTI_PROBE, String(Date.now())); }catch(e){}
+    fetchMulti(BOOT_KEYS).then(values=>{
+      try{ localStorage.setItem(MULTI_FLAG, 'yes'); }catch(e){}
+      storeMulti(values);
+    }).catch(()=>{});
+  }
+  return false;
+}
+
+/* 複数キーをまとめて取得する。getMulti 対応なら1往復、未対応なら従来どおり並列個別取得。 */
+async function fetchManyRaw(keys){
+  let supported = false;
+  try{ supported = localStorage.getItem(MULTI_FLAG) === 'yes'; }catch(e){}
+  if(supported){
+    try{
+      const values = await fetchMulti(keys);
+      keys.forEach(k=>{
+        const v = values[k];
+        const prev = cacheRead(k);
+        const norm = v==null ? '' : v;
+        cacheWrite(k, v);
+        if(prev !== undefined && norm !== prev) emitFresh(k, v);
+      });
+      return keys.map(k=> values[k]);
+    }catch(e){
+      if(e && e.unsupported){ try{ localStorage.removeItem(MULTI_FLAG); }catch(_){} }
+    }
+  }
+  return Promise.all(keys.map(k=> fetchShared(k).then(v=>{ cacheWrite(k, v); return v; }).catch(()=>null)));
+}
+
 const storage = {
   onFresh(key, fn){ (_freshListeners[key] = _freshListeners[key] || []).push(fn); },
   async get(key, shared, opts){
@@ -940,8 +1027,8 @@ const storage = {
     }
     const cached = (opts && opts.fresh) ? undefined : cacheRead(key);
     if(cached !== undefined){
-      // 先にキャッシュを返し、裏で最新を取得
-      fetchShared(key).then(value=>{
+      // 先にキャッシュを返し、裏で最新を取得（取得直後のキーは省略）
+      if(cacheAge(key) > FRESH_WINDOW_MS) fetchShared(key).then(value=>{
         const norm = value==null ? '' : value;
         if(norm !== cached){ cacheWrite(key, value); emitFresh(key, value); }
       }).catch(()=>{});
@@ -2817,9 +2904,10 @@ const NotifMod = (function(){
   }
 
   async function poll(){
-    const [boardPosts, chatMessages, projects, customers, attendance] = await Promise.all([
-      fetchRaw('bulletin-board'), fetchRaw('staff-chat'), fetchRaw('projects-db'), fetchRaw('customers-db'), fetchRaw('attendance-db')
-    ]);
+    const NOTIF_KEYS = ['bulletin-board','staff-chat','projects-db','customers-db','attendance-db'];
+    const raw = await fetchManyRaw(NOTIF_KEYS);
+    const parsed = raw.map(v=>{ try{ return v ? JSON.parse(v) : null; }catch(e){ return null; } });
+    const [boardPosts, chatMessages, projects, customers, attendance] = parsed;
     const prevIds = new Set(latestItems.map(it=>it.id));
     latestItems = buildItems(boardPosts, chatMessages, projects, customers, attendance);
     const brandNew = latestItems.filter(it=> !it.read && !prevIds.has(it.id));
@@ -3408,7 +3496,10 @@ async function startApp(){
   Home.render();
   setSyncing(true);
 
-  // ② プロフィールと各モジュールを並列で取得（直列待ちをやめる）
+  // ② バックエンドが一括取得に対応していれば 1往復で全部取る
+  await primeFromMulti();
+
+  // ③ プロフィールと各モジュールを並列で取得（直列待ちをやめる）
   await Promise.all([
     loadProfiles().then(()=> renderWhoAmI()),
     CrmMod.init(), BoardMod.init(), AttMod.init(), ProjMod.init()
